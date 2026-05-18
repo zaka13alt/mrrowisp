@@ -1,11 +1,11 @@
-import * as os from "os";
+import * as path from "node:path";
+import * as os from "node:os";
+import { fileURLToPath } from "node:url";
 
-const arch = os.arch()
-const platform = os.platform()
+const bin = os.platform() === "win32" ? "mrrowisp.exe" : "mrrowisp";
 
-const pkg = `${platform}-${arch}`
-const wispConfigPath = new URL("../dist/config.json", import.meta.url).pathname;
-const wispPath = new URL(`../dist/${pkg}/mrrowisp`, import.meta.url).pathname;
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const root = path.resolve(__dirname, "..");
 
-export { wispConfigPath, wispPath };
-
+export const configPath = path.join(root, "dist", "config.json");
+export const binPath = path.join(root, "bin", `${os.platform()}-${os.arch()}`, bin);

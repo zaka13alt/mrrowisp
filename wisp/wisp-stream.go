@@ -7,6 +7,9 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	prot "mrrowisp/wisp/protection"
 
 	"golang.org/x/net/proxy"
 )
@@ -27,40 +30,58 @@ type wispStream struct {
 
 	pendingMutex sync.Mutex
 	pendingData  [][]byte
+	pendingBytes int
 }
+
+const dnsLookupTimeout = 10 * time.Second
 
 func (s *wispStream) handleConnect(streamType uint8, port string, hostname string) {
 	defer s.signalConnReady()
 
 	cfg := s.wispConn.config
-	s.hostname = strings.ToLower(strings.TrimSpace(hostname))
-
-	if len(cfg.Whitelist.Hostnames) > 0 {
-		if _, ok := cfg.Whitelist.Hostnames[s.hostname]; !ok {
-			s.close(closeReasonBlocked)
-			return
-		}
-	} else if len(cfg.Blacklist.Hostnames) > 0 {
-		if _, ok := cfg.Blacklist.Hostnames[s.hostname]; ok {
-			s.close(closeReasonBlocked)
-			return
-		}
+	s.hostname = prot.NormalizeTargetHostname(hostname)
+	if s.hostname == "" {
+		s.close(closeReasonInvalidInfo)
+		return
 	}
 
-	resolvedHostname := hostname
-	if cfg.DNSCache != nil {
-		if _, whitelisted := cfg.Whitelist.Hostnames[hostname]; !whitelisted {
-			ips, err := cfg.DNSCache.LookupIPAddr(context.Background(), hostname)
-			if err != nil {
-				s.close(closeReasonUnreachable)
-				return
-			}
-			if len(ips) == 0 {
-				s.close(closeReasonUnreachable)
-				return
-			}
-			resolvedHostname = ips[0].IP.String()
+	guard := newProtection(cfg)
+
+	if reason, ok := guard.allowHostPort(s.hostname, port); !ok {
+		s.close(reason)
+		return
+	}
+
+	resolvedHostname := s.hostname
+
+	if ip := net.ParseIP(resolvedHostname); ip != nil {
+		if reason, ok := guard.allowDirectIP(ip, s.wispConn.remoteIP, s.hostname); !ok {
+			s.close(reason)
+			return
 		}
+		resolvedHostname = ip.String()
+	} else if cfg.Proxy != "" {
+		resolvedHostname = s.hostname
+	} else if cfg.DNSCache != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), dnsLookupTimeout)
+		ips, err := cfg.DNSCache.LookupIPAddr(ctx, resolvedHostname)
+		cancel()
+		if err != nil {
+			cfg.Logger.Warn("DNS lookup failed", "ip", s.wispConn.remoteIP, "hostname", resolvedHostname, "error", err)
+			s.close(closeReasonUnreachable)
+			return
+		}
+		if len(ips) == 0 {
+			cfg.Logger.Warn("DNS returned no results", "ip", s.wispConn.remoteIP, "hostname", resolvedHostname)
+			s.close(closeReasonUnreachable)
+			return
+		}
+		selected, reason, ok := guard.selectAllowedIP(ips, s.wispConn.remoteIP, resolvedHostname)
+		if !ok {
+			s.close(reason)
+			return
+		}
+		resolvedHostname = selected
 	}
 
 	s.streamType = streamType
@@ -71,18 +92,29 @@ func (s *wispStream) handleConnect(streamType uint8, port string, hostname strin
 	var err error
 	switch streamType {
 	case streamTypeTCP:
+		select {
+		case s.wispConn.dialSem <- struct{}{}:
+		case <-s.wispConn.closeCh:
+			return
+		}
 		if cfg.Proxy != "" {
-			dialer, proxyErr := proxy.SOCKS5("tcp", cfg.Proxy, nil, proxy.Direct)
+			proxyURL := cfg.Proxy
+			proxyURL = strings.Replace(proxyURL, "socks5h://", "socks5://", 1)
+			proxyURL = strings.Replace(proxyURL, "socks4a://", "socks4://", 1)
+			dialer, proxyErr := proxy.SOCKS5("tcp", stripScheme(proxyURL), nil, proxy.Direct)
 			if proxyErr != nil {
+				<-s.wispConn.dialSem
+				cfg.Logger.Warn("proxy dialer creation failed", "ip", s.wispConn.remoteIP, "error", proxyErr)
 				s.close(closeReasonNetworkError)
 				return
 			}
-			s.conn, err = dialer.Dial("tcp", destination)
+			s.conn, err = dialer.Dial("tcp", net.JoinHostPort(s.hostname, port))
 		} else {
 			s.conn, err = cfg.Dialer.Dial("tcp", destination)
 		}
+		<-s.wispConn.dialSem
 	case streamTypeUDP:
-		if cfg.DisableUDP || cfg.Proxy != "" {
+		if cfg.Proxy != "" || !cfg.AllowUDP {
 			s.close(closeReasonBlocked)
 			return
 		}
@@ -93,6 +125,7 @@ func (s *wispStream) handleConnect(streamType uint8, port string, hostname strin
 	}
 
 	if err != nil {
+		cfg.Logger.Warn("stream connection failed", "ip", s.wispConn.remoteIP, "hostname", hostname, "port", port, "error", err)
 		s.close(mapDialError(err))
 		return
 	}
@@ -109,12 +142,12 @@ func (s *wispStream) handleConnect(streamType uint8, port string, hostname strin
 		s.wispConn.sendPacket(s.streamId, s.bufferRemaining)
 	}
 
-	s.signalConnReady()
-
 	s.pendingMutex.Lock()
 	pending := s.pendingData
 	s.pendingData = nil
+	s.pendingBytes = 0
 	s.pendingMutex.Unlock()
+
 	for _, data := range pending {
 		if !s.isOpen.Load() {
 			return
@@ -125,7 +158,17 @@ func (s *wispStream) handleConnect(streamType uint8, port string, hostname strin
 		}
 	}
 
+	// Signal ready only after all pending data has been written in order.
+	s.signalConnReady()
+
 	s.readFromConnection()
+}
+
+func stripScheme(url string) string {
+	if idx := strings.Index(url, "://"); idx >= 0 {
+		return url[idx+3:]
+	}
+	return url
 }
 
 func (s *wispStream) signalConnReady() {
@@ -136,9 +179,7 @@ func (s *wispStream) signalConnReady() {
 
 func (s *wispStream) readFromConnection() {
 	const maxHeaderLen = 15
-	bufp := s.wispConn.config.ReadBufPool.Get().(*[]byte)
-	buf := *bufp
-	defer s.wispConn.config.ReadBufPool.Put(bufp)
+	buf := make([]byte, maxHeaderLen+65535)
 
 	streamId := s.streamId
 
@@ -162,10 +203,10 @@ func (s *wispStream) readFromConnection() {
 				frameStart = 0
 				buf[0] = 0x82
 				buf[1] = 127
-				buf[2] = 0
-				buf[3] = 0
-				buf[4] = 0
-				buf[5] = 0
+				buf[2] = byte(totalPayload >> 56)
+				buf[3] = byte(totalPayload >> 48)
+				buf[4] = byte(totalPayload >> 40)
+				buf[5] = byte(totalPayload >> 32)
 				buf[6] = byte(totalPayload >> 24)
 				buf[7] = byte(totalPayload >> 16)
 				buf[8] = byte(totalPayload >> 8)
@@ -181,12 +222,13 @@ func (s *wispStream) readFromConnection() {
 
 			frame := make([]byte, maxHeaderLen+n-frameStart)
 			copy(frame, buf[frameStart:maxHeaderLen+n])
-			s.wispConn.queueWrite(frame)
+			s.wispConn.queueWritePooled(frame)
 		}
 		if err != nil {
 			if err == io.EOF {
 				s.close(closeReasonVoluntary)
 			} else {
+				s.wispConn.config.Logger.Warn("stream read error", "ip", s.wispConn.remoteIP, "hostname", s.hostname, "error", err)
 				s.close(closeReasonNetworkError)
 			}
 			return

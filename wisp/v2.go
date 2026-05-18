@@ -1,14 +1,15 @@
 package wisp
 
 import (
-	"crypto/ed25519"
-	"crypto/rand"
-	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/binary"
 	"errors"
+	"time"
 )
 
 var errorInvalid = errors.New("invalid wisp v2 payload")
+
+const v2HandshakeTimeout = 15 * time.Second
 
 type extensions struct {
 	udp           bool
@@ -26,7 +27,7 @@ type extensions struct {
 func (c *wispConnection) buildServerInfoPacket() []byte {
 	var extensions []byte
 
-	if !c.config.DisableUDP {
+	if c.config.AllowUDP {
 		extensions = addExtension(extensions, extensionUDP, nil)
 	}
 
@@ -38,26 +39,8 @@ func (c *wispConnection) buildServerInfoPacket() []byte {
 		extensions = addExtension(extensions, extensionPasswordAuth, meta[:])
 	}
 
-	if c.config.CertAuth && len(c.config.CertAuthPublicKeys) > 0 {
-		challenge := make([]byte, 64)
-		rand.Read(challenge)
-		c.v2Challenge = challenge
-
-		meta := make([]byte, 2+len(challenge))
-		if c.config.CertAuthRequired {
-			meta[0] = 1
-		}
-		meta[1] = sigEd25519
-		copy(meta[2:], challenge)
-		extensions = addExtension(extensions, extensionCertificateAuth, meta)
-	}
-
 	if c.config.Motd != "" {
 		extensions = addExtension(extensions, extensionMotd, []byte(c.config.Motd))
-	}
-
-	if c.config.EnableStreamConfirm {
-		extensions = addExtension(extensions, extensionStreamConfirm, nil)
 	}
 
 	payload := make([]byte, 5+2+len(extensions))
@@ -87,7 +70,10 @@ func parseClientInfo(payload []byte) (*extensions, error) {
 	exts := &extensions{}
 	data := payload[2:]
 
-	for len(data) >= 5 {
+	for len(data) > 0 {
+		if len(data) < 5 {
+			return nil, errorInvalid
+		}
 		extID := data[0]
 		extLen := binary.LittleEndian.Uint32(data[1:5])
 		data = data[5:]
@@ -143,6 +129,7 @@ func parseClientInfo(payload []byte) (*extensions, error) {
 
 func (c *wispConnection) v2Handshake() {
 	c.handshakeDone = make(chan struct{})
+	_ = c.netConn.SetReadDeadline(time.Now().Add(v2HandshakeTimeout))
 
 	infoPayload := c.buildServerInfoPacket()
 	c.sendRawFrame(infoPayload)
@@ -154,6 +141,9 @@ func (c *wispConnection) handleInfo(streamId uint32, payload []byte) {
 	if streamId != 0 {
 		return
 	}
+	if c.handshakeDone == nil {
+		return
+	}
 
 	clientExts, err := parseClientInfo(payload)
 	if err != nil {
@@ -162,25 +152,18 @@ func (c *wispConnection) handleInfo(streamId uint32, payload []byte) {
 		return
 	}
 
-	authRequired := c.config.PasswordAuthRequired || c.config.CertAuthRequired
+	authRequired := c.config.PasswordAuthRequired
 	authPassed := false
 
 	if c.config.PasswordAuth && clientExts.passwordUsername != "" {
 		expectedPassword, userExists := c.config.PasswordUsers[clientExts.passwordUsername]
-		if userExists && expectedPassword == clientExts.passwordPassword {
+		expBytes := []byte(expectedPassword)
+		gotBytes := []byte(clientExts.passwordPassword)
+		ok := userExists && len(expBytes) == len(gotBytes) && subtle.ConstantTimeCompare(expBytes, gotBytes) == 1
+		if ok {
 			authPassed = true
 		} else {
 			c.sendClosePacket(0, closeReasonAuthBadPassword)
-			c.close()
-			return
-		}
-	}
-
-	if c.config.CertAuth && len(clientExts.certificateSig) > 0 && c.v2Challenge != nil {
-		if c.verifyCertificate(clientExts) {
-			authPassed = true
-		} else {
-			c.sendClosePacket(0, closeReasonAuthBadSignature)
 			c.close()
 			return
 		}
@@ -192,30 +175,15 @@ func (c *wispConnection) handleInfo(streamId uint32, payload []byte) {
 		return
 	}
 
-	c.streamConfirm = c.config.EnableStreamConfirm && clientExts.streamConfirm
+	c.authenticated.Store(authPassed)
+	c.streamConfirm = clientExts.streamConfirm
 
 	c.sendPacket(0, c.config.BufferRemainingLength)
 
+	_ = c.netConn.SetReadDeadline(time.Time{})
 	close(c.handshakeDone)
+	c.handshakeDone = nil
 }
-
-func (c *wispConnection) verifyCertificate(exts *extensions) bool {
-	if exts.certificateSelected&sigEd25519 == 0 {
-		return false
-	}
-
-	for _, pubKey := range c.config.CertAuthPublicKeys {
-		hash := sha256.Sum256([]byte(pubKey))
-		if hash == exts.certificatePubkeyHash {
-			if ed25519.Verify(pubKey, c.v2Challenge, exts.certificateSig) {
-				return true
-			}
-		}
-	}
-
-	return false
-}
-
 func (c *wispConnection) sendRawFrame(packet []byte) {
 	totalLen := len(packet)
 	var frame []byte

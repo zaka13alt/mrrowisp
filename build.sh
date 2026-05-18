@@ -1,26 +1,38 @@
 #!/bin/bash
 
-mkdir -p dist
+rm -rf bin
+mkdir -p bin
 
 if [ ! -f "main.go" ]; then
-	echo "main.go not found."
-	exit 1
+    echo "main.go not found."
+    exit 1
 fi
 
-for os in linux darwin; do
-	if [ "$os" = "win32" ]; then
-		goos="windows"
-	else
-		goos=$os
-	fi
-	for arch in x64 arm64; do
-		if [ "$arch" = "x64" ]; then
-			goarch="amd64"
-		else
-			goarch=$arch
-		fi
-		GOOS=$goos GOARCH=$goarch go build -o ./dist/${os}-${arch}/mrrowisp main.go
-	done
+for os in linux darwin win32; do
+    if [ "$os" = "win32" ]; then
+        goos="windows"
+    else
+        goos=$os
+    fi
+    for arch in x64 arm64; do
+        if [ "$arch" = "x64" ]; then
+            goarch="amd64"
+        else
+            goarch=$arch
+        fi
+        if [ "$os" = "win32" ]; then
+            ext=".exe"
+        else
+            ext=""
+        fi
+        mkdir -p bin/${os}-${arch}
+        GOOS=$goos GOARCH=$goarch go build -o ./bin/${os}-${arch}/mrrowisp${ext} main.go
+    done
 done
 
-echo "Finished building. Binaries in ./dist/PLATFORM-ARCH/mrrowisp"
+echo "Finished building to ./bin/"
+
+cp package.json README.md LICENSE dist/
+cp example.config.json dist/config.json
+
+echo "Finished copying package files to ./dist/"

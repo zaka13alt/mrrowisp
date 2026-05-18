@@ -1,187 +1,76 @@
 package main
 
 import (
-	"crypto/ed25519"
-	"encoding/hex"
-	"encoding/json"
+	"context"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
-	"strings"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"mrrowisp/wisp"
 )
 
-type Config struct {
-	Port                  int    `json:"port"`
-	DisableUDP            bool   `json:"disableUDP"`
-	TcpBufferSize         int    `json:"tcpBufferSize"`
-	BufferRemainingLength uint32 `json:"bufferRemainingLength"`
-	TcpNoDelay            bool   `json:"tcpNoDelay"`
-	WebsocketTcpNoDelay   bool   `json:"websocketTcpNoDelay"`
-
-	Blacklist struct {
-		Hostnames []string `json:"hostnames"`
-	} `json:"blacklist"`
-	Whitelist struct {
-		Hostnames []string `json:"hostnames"`
-	} `json:"whitelist"`
-
-	Proxy                      string   `json:"proxy"`
-	WebsocketPermessageDeflate bool     `json:"websocketPermessageDeflate"`
-	DnsServers                 []string `json:"dnsServers"`
-
-	EnableTwisp bool `json:"enableTwisp"`
-
-	EnableV2             bool              `json:"enableV2"`
-	Motd                 string            `json:"motd"`
-	PasswordAuth         bool              `json:"passwordAuth"`
-	PasswordAuthRequired bool              `json:"passwordAuthRequired"`
-	PasswordUsers        map[string]string `json:"passwordUsers"`
-	CertAuth             bool              `json:"certAuth"`
-	CertAuthRequired     bool              `json:"certAuthRequired"`
-	CertAuthPublicKeys   []string          `json:"certAuthPublicKeys"`
-	EnableStreamConfirm  bool              `json:"enableStreamConfirm"`
-}
-
-func defaultConfig() Config {
-	return Config{
-		Port:                       6001,
-		DisableUDP:                 false,
-		TcpBufferSize:              32768,
-		BufferRemainingLength:      65536,
-		TcpNoDelay:                 true,
-		WebsocketTcpNoDelay:        true,
-		WebsocketPermessageDeflate: false,
-		EnableTwisp:                false,
-		EnableV2:                   false,
-		PasswordAuth:               false,
-		PasswordAuthRequired:       false,
-		PasswordUsers:              make(map[string]string),
-		CertAuth:                   false,
-		CertAuthRequired:           false,
-		EnableStreamConfirm:        false,
-	}
-}
-
-func loadConfig(config string) (Config, error) {
-	cfg := defaultConfig()
-
-	trimConfig := strings.TrimSpace(config)
-	if strings.HasPrefix(trimConfig, "{") {
-		if err := json.Unmarshal([]byte(trimConfig), &cfg); err != nil {
-			return cfg, err
-		}
-		return cfg, nil
-	}
-
-	file, err := os.Open(config)
-	if err != nil {
-		return cfg, err
-	}
-	defer file.Close()
-
-	decoder := json.NewDecoder(file)
-	if err := decoder.Decode(&cfg); err != nil {
-		return cfg, err
-	}
-	return cfg, nil
-}
-
-func createWispConfig(cfg Config) *wisp.Config {
-	blacklistedHostnames := make(map[string]struct{})
-	for _, host := range cfg.Blacklist.Hostnames {
-		blacklistedHostnames[host] = struct{}{}
-	}
-
-	whitelistedHostnames := make(map[string]struct{})
-	for _, host := range cfg.Whitelist.Hostnames {
-		whitelistedHostnames[host] = struct{}{}
-	}
-
-	var pubKeys []ed25519.PublicKey
-	for _, hexKey := range cfg.CertAuthPublicKeys {
-		hexKeyBytes, err := hex.DecodeString(hexKey)
-		if err != nil {
-			fmt.Printf("warning: invalid public key hex %q: %v\n", hexKey, err)
-			continue
-		}
-		if len(hexKeyBytes) != ed25519.PublicKeySize {
-			fmt.Printf("warning: public key %q has invalid length %d (expected %d)\n", hexKey, len(hexKeyBytes), ed25519.PublicKeySize)
-			continue
-		}
-		pubKeys = append(pubKeys, ed25519.PublicKey(hexKeyBytes))
-	}
-
-	wispCfg := &wisp.Config{
-		DisableUDP:            cfg.DisableUDP,
-		TcpBufferSize:         cfg.TcpBufferSize,
-		BufferRemainingLength: cfg.BufferRemainingLength,
-		TcpNoDelay:            cfg.TcpNoDelay,
-		WebsocketTcpNoDelay:   cfg.WebsocketTcpNoDelay,
-		Blacklist: struct {
-			Hostnames map[string]struct{}
-		}{
-			Hostnames: blacklistedHostnames,
-		},
-		Whitelist: struct {
-			Hostnames map[string]struct{}
-		}{
-			Hostnames: whitelistedHostnames,
-		},
-		Proxy:                      cfg.Proxy,
-		WebsocketPermessageDeflate: cfg.WebsocketPermessageDeflate,
-		DnsServers:                 cfg.DnsServers,
-		EnableTwisp:                cfg.EnableTwisp,
-		EnableV2:                   cfg.EnableV2,
-		Motd:                       cfg.Motd,
-		PasswordAuth:               cfg.PasswordAuth,
-		PasswordAuthRequired:       cfg.PasswordAuthRequired,
-		PasswordUsers:              cfg.PasswordUsers,
-		CertAuth:                   cfg.CertAuth,
-		CertAuthRequired:           cfg.CertAuthRequired,
-		CertAuthPublicKeys:         pubKeys,
-		EnableStreamConfirm:        cfg.EnableStreamConfirm,
-	}
-
-	if wispCfg.PasswordUsers == nil {
-		wispCfg.PasswordUsers = make(map[string]string)
-	}
-
-	return wispCfg
-}
-
 func main() {
 	fConfig := flag.String("config", "", "config to load (file or json string)")
 	fPort := flag.Int("port", 0, "port to run on")
+	fAllowLoopbackIPs := flag.Bool("allow-loopback", false, "allow loopback IP targets")
 	flag.Parse()
 
-	var cfg Config
+	var cfg wisp.Config
 	var err error
 
 	if *fConfig != "" {
-		cfg, err = loadConfig(*fConfig)
+		cfg, err = wisp.LoadConfig(*fConfig)
 		if err != nil {
 			fmt.Printf("Failed to load config: %v\n", err)
 			return
 		}
 	} else {
-		cfg = defaultConfig()
+		cfg = wisp.DefaultConfig()
 	}
 
 	if *fPort != 0 {
 		cfg.Port = *fPort
 	}
+	if *fAllowLoopbackIPs != false {
+		cfg.AllowLoopbackIPs = *fAllowLoopbackIPs
+	}
 
-	wispConfig := createWispConfig(cfg)
+	wispConfig := wisp.CreateWispConfig(cfg)
 
 	wispHandler := wisp.CreateWispHandler(wispConfig)
 
-	http.HandleFunc("/", wispHandler)
-	fmt.Printf("Starting Mrrowisp on port %d. . .", cfg.Port)
-	err = http.ListenAndServe(fmt.Sprintf(":%d", cfg.Port), nil)
-	if err != nil {
-		fmt.Printf("Failed to start Mrrowisp: %v", err)
+	if cfg.StaticDir != "" {
+		http.Handle("/", http.FileServer(http.Dir(cfg.StaticDir)))
+		http.HandleFunc("/wisp", wispHandler)
+	} else {
+		http.HandleFunc("/", wispHandler)
+	}
+	fmt.Printf("[INFO] Starting Mrrowisp on port %d. . .\n", cfg.Port)
+	server := &http.Server{
+		Addr:              fmt.Sprintf(":%d", cfg.Port),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	sigch := make(chan os.Signal, 1)
+	signal.Notify(sigch, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		sig := <-sigch
+		fmt.Printf("[INFO] Shutting down (signal: %s)\n", sig.String())
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if shutdownErr := server.Shutdown(ctx); shutdownErr != nil {
+			fmt.Printf("[INFO] Shutdown error: %v\n", shutdownErr)
+		}
+	}()
+
+	err = server.ListenAndServe()
+	if err != nil && err != http.ErrServerClosed {
+		fmt.Printf("[INFO] Failed to start Mrrowisp: %v", err)
 	}
 }

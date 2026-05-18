@@ -1,65 +1,38 @@
 package wisp
 
 import (
-	"crypto/ed25519"
 	"net"
 	"net/http"
-	"sync"
+	"strings"
 	"time"
+
+	"mrrowisp/wisp/protection"
 
 	"github.com/lxzan/gws"
 )
 
-type Config struct {
-	DisableUDP bool
+const (
+	defaultStreamLimitPerHost    = 512
+	defaultStreamLimitTotal      = 16384
+	defaultMaxConnectsPerSecond  = 20
+	defaultConnectionsLimitPerIP = 120
+	defaultHandshakeFailures     = 10
+)
 
-	TcpBufferSize         int
-	BufferRemainingLength uint32
-	TcpNoDelay            bool
-	WebsocketTcpNoDelay   bool
-
-	Blacklist struct {
-		Hostnames map[string]struct{}
-	}
-	Whitelist struct {
-		Hostnames map[string]struct{}
-	}
-
-	Proxy                      string
-	WebsocketPermessageDeflate bool
-
-	DnsServers []string
-
-	EnableTwisp bool
-
-	EnableV2             bool
-	Motd                 string
-	PasswordAuth         bool
-	PasswordAuthRequired bool
-	PasswordUsers        map[string]string
-	CertAuth             bool
-	CertAuthRequired     bool
-	CertAuthPublicKeys   []ed25519.PublicKey
-	EnableStreamConfirm  bool
-
-	DNSCache    *DNSCache
-	ReadBufPool sync.Pool
-	Dialer      net.Dialer
-}
-
-func DefaultConfig() *Config {
-	return &Config{
-		DisableUDP:            false,
-		TcpBufferSize:         32768,
-		BufferRemainingLength: 65536,
-		TcpNoDelay:            true,
-		WebsocketTcpNoDelay:   true,
-		PasswordUsers:         make(map[string]string),
-	}
-}
-
-func (c *Config) InitResolver() {
-	c.DNSCache = NewDNSCache(c.DnsServers)
+func (cfg *Config) InitResolver() {
+	cfg.DNSCache = NewDNSCache(
+		DNSCacheConfig{
+			Servers:     cfg.DnsServers,
+			Method:      cfg.DnsMethod,
+			ResultOrder: cfg.DnsResultOrder,
+		})
+	// if cfg.BandwidthLimitKbps > 0 {
+	// 	cfg.BandwidthLimiter = protection.NewBandwidthLimiter(cfg.BandwidthLimitKbps, time.Duration(cfg.ConnectionWindowSeconds)*time.Second)
+	// }
+	// if cfg.ConnectionsLimitPerIP > 0 {
+	// 	cfg.ConnectionLimiter = protection.NewConnectionLimiter(cfg.ConnectionsLimitPerIP, time.Duration(cfg.ConnectionWindowSeconds)*time.Second)
+	// }
+	cfg.Logger = newLogger(cfg.LogLevel)
 }
 
 type upgradeHandler struct {
@@ -69,51 +42,67 @@ type upgradeHandler struct {
 func CreateWispHandler(config *Config) http.HandlerFunc {
 	config.InitResolver()
 
-	readBufSize := 15 + config.TcpBufferSize
-	config.ReadBufPool = sync.Pool{
-		New: func() any {
-			buf := make([]byte, readBufSize)
-			return &buf
-		},
-	}
-
-	config.Dialer = net.Dialer{
-		Timeout:   15 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}
-
 	upgrader := gws.NewUpgrader(&upgradeHandler{}, &gws.ServerOption{
 		PermessageDeflate: gws.PermessageDeflate{
-			Enabled: config.WebsocketPermessageDeflate,
+			Enabled: false,
 		},
 	})
 
+	guard := newProtection(config)
+
 	return func(w http.ResponseWriter, r *http.Request) {
 		useV2 := config.EnableV2 && r.Header.Get("Sec-WebSocket-Protocol") != ""
+		remoteIP := protection.RemoteIPFromRequest(r, protection.IPConfig{
+			AllowDirectIP:    config.AllowDirectIP,
+			AllowPrivateIPs:  config.AllowPrivateIPs,
+			AllowLoopbackIPs: config.AllowLoopbackIPs,
+			ParseRealIP:      config.ParseRealIP,
+		})
+		config.Logger.Info("incoming connection", "ip", remoteIP, "path", r.URL.Path, "origin", r.Header.Get("Origin"))
+		if config.requiresV2() && !useV2 {
+			config.Logger.Warn("v2 required but not negotiated", "ip", remoteIP)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		if status, response, ok := guard.allowHTTP(r, remoteIP, useV2); !ok {
+			w.WriteHeader(status)
+			if response != "" {
+				_, _ = w.Write([]byte(response))
+			}
+			return
+		}
 
 		wsConn, err := upgrader.Upgrade(w, r)
 		if err != nil {
+			if config.NonWSResponse != "" {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(config.NonWSResponse))
+			}
+			config.Logger.Debug("websocket upgrade failed", "error", err)
 			return
 		}
 
 		netConn := wsConn.NetConn()
 
 		if tc, ok := netConn.(*net.TCPConn); ok {
-			if config.WebsocketTcpNoDelay {
-				tc.SetNoDelay(true)
-			}
 			tc.SetReadBuffer(1 << 20)
 			tc.SetWriteBuffer(1 << 20)
 		}
 
 		wc := &wispConnection{
-			netConn:      netConn,
-			writeCh:      make(chan writeReq, 4096), // funny number
+			netConn: netConn,
+			// writeCh:   make(chan writeReq, writeQSize),
 			config:       config,
 			twispStreams: newTwisp(),
 			isV2:         useV2,
+			remoteIP:     remoteIP,
+			dialSem:      make(chan struct{}, maxConcurrentDials),
+			closeCh:      make(chan struct{}),
+			createdAt:    time.Now(),
 		}
 
+		config.Logger.Info("connection established", "ip", remoteIP, "v2", useV2)
 		go wc.writeLoop()
 
 		if useV2 {
@@ -123,4 +112,27 @@ func CreateWispHandler(config *Config) http.HandlerFunc {
 			go wc.readLoop()
 		}
 	}
+}
+
+func (cfg *Config) requiresV2() bool {
+	if cfg == nil {
+		return false
+	}
+	return cfg.PasswordAuthRequired || cfg.EnableTwisp
+}
+
+func originAllowed(r *http.Request, allowedOrigins []string) bool {
+	if len(allowedOrigins) == 0 {
+		return true
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return false
+	}
+	for _, allowed := range allowedOrigins {
+		if origin == strings.TrimSpace(allowed) {
+			return true
+		}
+	}
+	return false
 }
