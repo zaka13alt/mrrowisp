@@ -17,86 +17,94 @@ func (c *wispConnection) close() {
 	}
 	c.netConn.Close()
 	close(c.closeCh)
+
+	c.pendingMutex.Lock()
+	if !c.writeActive {
+		pending := c.pendingWrites
+		c.pendingWrites = nil
+		c.pendingMutex.Unlock()
+		for _, r := range pending {
+			if r.buf != nil {
+				c.config.ReadBufPool.Put(r.buf)
+			}
+		}
+	} else {
+		c.pendingMutex.Unlock()
+	}
 }
 
-func (c *wispConnection) writeLoop() {
-	bufs := make(net.Buffers, 0, 64)
-	pooled := make([]*[]byte, 0, 64)
+func (c *wispConnection) runWriter() {
+	var bufs net.Buffers
+	var pooled []*[]byte
+	batch := make([]writeReq, 0, 16)
 
-	releasePooled := func() {
+	for {
+		c.pendingMutex.Lock()
+		if len(c.pendingWrites) == 0 {
+			c.writeActive = false
+			c.pendingMutex.Unlock()
+			return
+		}
+		batch, c.pendingWrites = c.pendingWrites, batch[:0]
+		c.pendingMutex.Unlock()
+
+		if cap(bufs) < len(batch) {
+			bufs = make(net.Buffers, 0, len(batch))
+			pooled = make([]*[]byte, 0, len(batch))
+		} else {
+			bufs = bufs[:0]
+			pooled = pooled[:0]
+		}
+		for _, r := range batch {
+			bufs = append(bufs, r.data)
+			if r.buf != nil {
+				pooled = append(pooled, r.buf)
+			}
+		}
+
+		var err error
+		if len(bufs) == 1 {
+			_, err = c.netConn.Write(bufs[0])
+		} else {
+			_, err = bufs.WriteTo(c.netConn)
+		}
 		for _, p := range pooled {
 			c.config.ReadBufPool.Put(p)
 		}
-		pooled = pooled[:0]
-	}
-
-	for {
-		var req writeReq
-		select {
-		case req = <-c.writeCh:
-		case <-c.closeCh:
-			for {
-				select {
-				case r := <-c.writeCh:
-					if r.buf != nil {
-						pooled = append(pooled, r.buf)
-					}
-				default:
-					releasePooled()
-					return
-				}
-			}
-		}
-
-		bufs = append(bufs[:0], req.data)
-		if req.buf != nil {
-			pooled = append(pooled, req.buf)
-		}
-	drain:
-		for len(bufs) < 256 {
-			select {
-			case r := <-c.writeCh:
-				bufs = append(bufs, r.data)
-				if r.buf != nil {
-					pooled = append(pooled, r.buf)
-				}
-			default:
-				break drain
-			}
-		}
-		_, err := bufs.WriteTo(c.netConn)
-		releasePooled()
 		if err != nil {
+			c.pendingMutex.Lock()
+			c.writeActive = false
+			c.pendingMutex.Unlock()
 			c.close()
 			return
 		}
 	}
 }
 
-func (c *wispConnection) queueWrite(data []byte) {
+func (c *wispConnection) submitWrite(req writeReq) {
 	if c.isClosed.Load() {
+		if req.buf != nil {
+			c.config.ReadBufPool.Put(req.buf)
+		}
 		return
 	}
-	select {
-	case c.writeCh <- writeReq{data: data}:
-	case <-c.closeCh:
+	c.pendingMutex.Lock()
+	c.pendingWrites = append(c.pendingWrites, req)
+	if c.writeActive {
+		c.pendingMutex.Unlock()
+		return
 	}
+	c.writeActive = true
+	c.pendingMutex.Unlock()
+	c.runWriter()
+}
+
+func (c *wispConnection) queueWrite(data []byte) {
+	c.submitWrite(writeReq{data: data})
 }
 
 func (c *wispConnection) queueWritePooled(data []byte, buf *[]byte) {
-	if c.isClosed.Load() {
-		if buf != nil {
-			c.config.ReadBufPool.Put(buf)
-		}
-		return
-	}
-	select {
-	case c.writeCh <- writeReq{data: data, buf: buf}:
-	case <-c.closeCh:
-		if buf != nil {
-			c.config.ReadBufPool.Put(buf)
-		}
-	}
+	c.submitWrite(writeReq{data: data, buf: buf})
 }
 
 func (c *wispConnection) handlePacket(packetType uint8, streamId uint32, payload []byte) {
@@ -154,11 +162,12 @@ func (c *wispConnection) handleConnectPacket(streamId uint32, payload []byte) {
 	}
 
 	stream := &wispStream{
-		wispConn:  c,
-		streamId:  streamId,
-		connReady: make(chan struct{}),
-		hostname:  strings.ToLower(strings.TrimSpace(hostname)),
-		portNum:   int(portU16),
+		wispConn:       c,
+		streamId:       streamId,
+		connReady:      make(chan struct{}),
+		hostname:       strings.ToLower(strings.TrimSpace(hostname)),
+		portNum:        int(portU16),
+		pendingIngress: make([]ingressJob, 0, 16),
 	}
 	stream.isOpen.Store(true)
 
@@ -267,7 +276,7 @@ func (c *wispConnection) handleDataPacket(streamId uint32, payload []byte, bufp 
 		stream.pendingMutex.Unlock()
 	}
 
-	if stream.streamType == streamTypeTCP && stream.ingressCh != nil {
+	if stream.streamType == streamTypeTCP && stream.ingressActive.Load() {
 		if !stream.queueIngressOwned(payload, bufp) {
 			return false
 		}

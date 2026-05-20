@@ -79,6 +79,21 @@ func (s *wispStream) handleConnect(streamType uint8, port string, hostname strin
 		}
 	}
 
+	portU16 := uint16(s.portNum)
+	if len(cfg.Whitelist.Ports) > 0 {
+		if _, ok := cfg.Whitelist.Ports[portU16]; !ok {
+			cfg.Logger.Warn("port block: not in whitelist", "ip", s.wispConn.remoteIP, "host", s.hostname, "port", port)
+			s.close(closeReasonBlocked)
+			return
+		}
+	} else if len(cfg.Blacklist.Ports) > 0 {
+		if _, ok := cfg.Blacklist.Ports[portU16]; ok {
+			cfg.Logger.Warn("port block: in blacklist", "ip", s.wispConn.remoteIP, "host", s.hostname, "port", port)
+			s.close(closeReasonBlocked)
+			return
+		}
+	}
+
 	policy := PolicyFromConfig(cfg)
 
 	resolvedHostname := hostname
@@ -244,6 +259,7 @@ func (s *wispStream) handleConnect(streamType uint8, port string, hostname strin
 			tc.SetReadBuffer(4 << 20)
 			tc.SetWriteBuffer(4 << 20)
 		}
+		setTCPLowLatency(s.conn)
 	}
 
 	if s.wispConn.streamConfirm && streamType == streamTypeTCP {
@@ -267,7 +283,7 @@ func (s *wispStream) handleConnect(streamType uint8, port string, hostname strin
 	}
 
 	if streamType == streamTypeTCP {
-		s.startIngressWriter()
+		s.ingressActive.Store(true)
 	}
 
 	s.signalConnReady()
@@ -282,97 +298,91 @@ func stripScheme(url string) string {
 	return url
 }
 
-func (s *wispStream) signalConnReady() {
-	if s.connReadyDone.CompareAndSwap(false, true) {
-		close(s.connReady)
-	}
-}
+func (s *wispStream) runIngressWriter() {
+	var bufs net.Buffers
+	var jobs []ingressJob
+	batch := make([]ingressJob, 0, 16)
 
-func (s *wispStream) startIngressWriter() {
-	if s.ingressCh != nil {
-		return
-	}
-	s.ingressCh = make(chan ingressJob, 64)
-	go func() {
-		bufs := make(net.Buffers, 0, 32)
-		jobs := make([]ingressJob, 0, 32)
-		flushReleases := func() {
+	for {
+		s.pendingIngMu.Lock()
+		if len(s.pendingIngress) == 0 {
+			s.ingressWriting = false
+			s.pendingIngMu.Unlock()
+			return
+		}
+		batch, s.pendingIngress = s.pendingIngress, batch[:0]
+		s.pendingIngMu.Unlock()
+
+		if cap(bufs) < len(batch) {
+			bufs = make(net.Buffers, 0, len(batch))
+			jobs = make([]ingressJob, 0, len(batch))
+		} else {
+			bufs = bufs[:0]
+			jobs = jobs[:0]
+		}
+		for _, j := range batch {
+			bufs = append(bufs, j.payload)
+			jobs = append(jobs, j)
+		}
+
+		if !s.isOpen.Load() {
 			for i := range jobs {
 				releaseIngressJob(jobs[i])
 			}
-			jobs = jobs[:0]
+			s.pendingIngMu.Lock()
+			s.ingressWriting = false
+			s.pendingIngMu.Unlock()
+			return
 		}
 
-		for first := range s.ingressCh {
-			bufs = append(bufs[:0], first.payload)
-			jobs = append(jobs, first)
-		drain:
-			for len(bufs) < 32 {
-				select {
-				case more, ok := <-s.ingressCh:
-					if !ok {
-						break drain
-					}
-					bufs = append(bufs, more.payload)
-					jobs = append(jobs, more)
-				default:
-					break drain
-				}
-			}
-			if !s.isOpen.Load() {
-				flushReleases()
-				continue
-			}
-			_, err := bufs.WriteTo(s.conn)
-			flushReleases()
-			if err != nil {
-				s.close(closeReasonNetworkError)
-				for extra := range s.ingressCh {
-					releaseIngressJob(extra)
-				}
-				return
-			}
+		var err error
+		if len(bufs) == 1 {
+			_, err = s.conn.Write(bufs[0])
+		} else {
+			_, err = bufs.WriteTo(s.conn)
 		}
-	}()
+		for i := range jobs {
+			releaseIngressJob(jobs[i])
+		}
+		if err != nil {
+			s.pendingIngMu.Lock()
+			s.ingressWriting = false
+			s.pendingIngMu.Unlock()
+			s.close(closeReasonNetworkError)
+			return
+		}
+	}
 }
 
-func (s *wispStream) queueIngress(payload []byte) bool {
-	if s.ingressCh == nil || !s.isOpen.Load() {
+func (s *wispStream) submitIngress(job ingressJob) bool {
+	if !s.ingressActive.Load() || !s.isOpen.Load() {
+		releaseIngressJob(job)
 		return false
 	}
-	bufp := getIngressBuf(len(payload))
-	copy(*bufp, payload)
-	job := ingressJob{
-		payload: *bufp,
-		bufp:    bufp,
-		pool:    ingressPoolCopy,
+	s.pendingIngMu.Lock()
+	s.pendingIngress = append(s.pendingIngress, job)
+	if s.ingressWriting {
+		s.pendingIngMu.Unlock()
+		return true
 	}
-	defer func() {
-		if r := recover(); r != nil {
-			putIngressBuf(bufp)
-		}
-	}()
-	s.ingressCh <- job
+	s.ingressWriting = true
+	s.pendingIngMu.Unlock()
+	s.runIngressWriter()
 	return true
 }
 
 func (s *wispStream) queueIngressOwned(payload []byte, bufp *[]byte) bool {
-	if s.ingressCh == nil || !s.isOpen.Load() {
+	if !s.ingressActive.Load() || !s.isOpen.Load() {
 		putWSPayloadBuf(bufp)
 		return false
 	}
-	job := ingressJob{
-		payload: payload,
-		bufp:    bufp,
-		pool:    ingressPoolWS,
+	return s.submitIngress(ingressJob{payload: payload, bufp: bufp, pool: ingressPoolWS})
+}
+
+func (s *wispStream) signalConnReady() {
+	if s.connReadyDone.CompareAndSwap(false, true) {
+		close(s.connReady)
 	}
-	defer func() {
-		if r := recover(); r != nil {
-			putWSPayloadBuf(bufp)
-		}
-	}()
-	s.ingressCh <- job
-	return true
 }
 
 func (s *wispStream) readFromConnection() {
@@ -452,9 +462,19 @@ func (s *wispStream) close(reason uint8) {
 		s.conn.Close()
 	}
 
-	if s.ingressCh != nil {
-		defer func() { recover() }()
-		close(s.ingressCh)
+	if s.ingressActive.Load() {
+		s.ingressActive.Store(false)
+		s.pendingIngMu.Lock()
+		if !s.ingressWriting {
+			drained := s.pendingIngress
+			s.pendingIngress = nil
+			s.pendingIngMu.Unlock()
+			for _, j := range drained {
+				releaseIngressJob(j)
+			}
+		} else {
+			s.pendingIngMu.Unlock()
+		}
 	}
 
 	s.wispConn.sendClosePacket(s.streamId, reason)

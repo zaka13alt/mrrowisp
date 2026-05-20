@@ -1,9 +1,9 @@
 package wisp
 
 import (
-	"bufio"
 	"encoding/binary"
 	"io"
+	"net"
 	"sync"
 	"unsafe"
 )
@@ -34,25 +34,109 @@ func putWSPayloadBuf(bufp *[]byte) {
 	wsPayloadPool.Put(bufp)
 }
 
+const readFrameBufSize = 64 * 1024
+
+type frameReader struct {
+	conn net.Conn
+	buf  []byte
+	r, w int
+}
+
+func newFrameReader(conn net.Conn) *frameReader {
+	return &frameReader{
+		conn: conn,
+		buf:  make([]byte, readFrameBufSize),
+	}
+}
+
+func (f *frameReader) fill(min int) error {
+	if f.w-f.r >= min {
+		return nil
+	}
+	if f.r > 0 {
+		copy(f.buf, f.buf[f.r:f.w])
+		f.w -= f.r
+		f.r = 0
+	}
+	for f.w-f.r < min {
+		n, err := f.conn.Read(f.buf[f.w:])
+		if n > 0 {
+			f.w += n
+		}
+		if err != nil {
+			if f.w-f.r >= min {
+				return nil
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *frameReader) peek(n int) ([]byte, error) {
+	if err := f.fill(n); err != nil {
+		return nil, err
+	}
+	return f.buf[f.r : f.r+n], nil
+}
+
+func (f *frameReader) consume(n int) {
+	f.r += n
+	if f.r == f.w {
+		f.r, f.w = 0, 0
+	}
+}
+
+func (f *frameReader) readPayload(dst []byte) error {
+	if buffered := f.w - f.r; buffered > 0 {
+		if buffered >= len(dst) {
+			copy(dst, f.buf[f.r:f.r+len(dst)])
+			f.consume(len(dst))
+			return nil
+		}
+		copy(dst, f.buf[f.r:f.w])
+		dst = dst[buffered:]
+		f.r, f.w = 0, 0
+	}
+	_, err := io.ReadFull(f.conn, dst)
+	return err
+}
+
 func (c *wispConnection) readLoop() {
 	defer c.deleteAllWispStreams()
-	reader := bufio.NewReaderSize(c.netConn, 512*1024)
-
-	var headerBuffer [14]byte
+	reader := newFrameReader(c.netConn)
 
 	for {
-		if _, err := io.ReadFull(reader, headerBuffer[:2]); err != nil {
+		hdr, err := reader.peek(2)
+		if err != nil {
 			return
 		}
 
-		fin := headerBuffer[0]&0x80 != 0
-		rsv := headerBuffer[0] & 0x70
-		opcode := headerBuffer[0] & 0x0F
-		masked := headerBuffer[1]&0x80 != 0
-		lengthCode := headerBuffer[1] & 0x7F
+		b0 := hdr[0]
+		b1 := hdr[1]
+		fin := b0&0x80 != 0
+		rsv := b0 & 0x70
+		opcode := b0 & 0x0F
+		masked := b1&0x80 != 0
+		lengthCode := b1 & 0x7F
 
 		if rsv != 0 || !masked || !fin {
 			c.sendWSClose(1002)
+			return
+		}
+
+		headerLen := 2
+		switch {
+		case lengthCode == 126:
+			headerLen += 2
+		case lengthCode == 127:
+			headerLen += 8
+		case lengthCode <= 125:
+		}
+		headerLen += 4
+
+		hdr, err = reader.peek(headerLen)
+		if err != nil {
 			return
 		}
 
@@ -61,15 +145,9 @@ func (c *wispConnection) readLoop() {
 		case lengthCode <= 125:
 			payloadLen = uint64(lengthCode)
 		case lengthCode == 126:
-			if _, err := io.ReadFull(reader, headerBuffer[2:4]); err != nil {
-				return
-			}
-			payloadLen = uint64(binary.BigEndian.Uint16(headerBuffer[2:4]))
+			payloadLen = uint64(binary.BigEndian.Uint16(hdr[2:4]))
 		case lengthCode == 127:
-			if _, err := io.ReadFull(reader, headerBuffer[2:10]); err != nil {
-				return
-			}
-			payloadLen = binary.BigEndian.Uint64(headerBuffer[2:10])
+			payloadLen = binary.BigEndian.Uint64(hdr[2:10])
 		}
 
 		isControlFrame := opcode >= 0x8
@@ -79,11 +157,8 @@ func (c *wispConnection) readLoop() {
 		}
 
 		var maskKey [4]byte
-		if masked {
-			if _, err := io.ReadFull(reader, maskKey[:]); err != nil {
-				return
-			}
-		}
+		copy(maskKey[:], hdr[headerLen-4:headerLen])
+		reader.consume(headerLen)
 
 		if payloadLen > c.maxPayloadSize() {
 			c.sendWSClose(1009)
@@ -94,13 +169,13 @@ func (c *wispConnection) readLoop() {
 		payload := (*bufp)[:payloadLen]
 
 		if payloadLen > 0 {
-			if _, err := io.ReadFull(reader, payload); err != nil {
+			if err := reader.readPayload(payload); err != nil {
 				putWSPayloadBuf(bufp)
 				return
 			}
 		}
 
-		if masked && payloadLen > 0 {
+		if payloadLen > 0 {
 			maskXOR(payload, maskKey)
 		}
 
@@ -122,7 +197,6 @@ func (c *wispConnection) readLoop() {
 			putWSPayloadBuf(bufp)
 			return
 		default:
-			continue
 		}
 
 		if !keep {

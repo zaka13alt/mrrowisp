@@ -135,6 +135,7 @@ func CreateWispHandler(config *Config) http.HandlerFunc {
 			tc.SetWriteBuffer(4 << 20)
 			tc.SetNoDelay(true)
 		}
+		setTCPLowLatency(netConn)
 
 		var trusted []*net.IPNet
 		if config.ParseRealIP {
@@ -143,18 +144,16 @@ func CreateWispHandler(config *Config) http.HandlerFunc {
 		remoteIP := ResolveClientIP(r, trusted, config.TrustedHeaders)
 
 		wc := &wispConnection{
-			netConn:      netConn,
-			writeCh:      make(chan writeReq, 4096), // funny number
-			closeCh:      make(chan struct{}),
-			config:       config,
-			twispStreams: newTwisp(),
-			isV2:         useV2,
-			remoteIP:     remoteIP.String(),
-			globals:      config.Globals,
-			connID:       atomic.AddUint64(&connIDCounter, 1),
+			netConn:       netConn,
+			closeCh:       make(chan struct{}),
+			config:        config,
+			twispStreams:  newTwisp(),
+			isV2:          useV2,
+			remoteIP:      remoteIP.String(),
+			globals:       config.Globals,
+			connID:        atomic.AddUint64(&connIDCounter, 1),
+			pendingWrites: make([]writeReq, 0, 16),
 		}
-
-		go wc.writeLoop()
 
 		if useV2 {
 			go wc.v2Handshake()

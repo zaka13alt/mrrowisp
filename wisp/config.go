@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,9 +39,12 @@ func (f *FilterSet) UnmarshalJSON(data []byte) error {
 				f.Hostnames[strings.ToLower(h)] = struct{}{}
 			}
 		} else {
-			var obj map[string]struct{}
+			var obj map[string]json.RawMessage
 			if err := json.Unmarshal(raw.Hostnames, &obj); err != nil {
 				return fmt.Errorf("hostnames: expected array of strings, got %s", string(raw.Hostnames))
+			}
+			for h := range obj {
+				f.Hostnames[strings.ToLower(h)] = struct{}{}
 			}
 		}
 	}
@@ -72,9 +76,16 @@ func (f *FilterSet) UnmarshalJSON(data []byte) error {
 				}
 			}
 		} else {
-			var obj map[string]struct{}
+			var obj map[string]json.RawMessage
 			if err := json.Unmarshal(raw.Ports, &obj); err != nil {
 				return fmt.Errorf("ports: expected array, got %s", string(raw.Ports))
+			}
+			for k := range obj {
+				n, perr := strconv.ParseUint(k, 10, 16)
+				if perr != nil {
+					return fmt.Errorf("ports: object key %q is not a valid port number", k)
+				}
+				f.Ports[uint16(n)] = struct{}{}
 			}
 		}
 	}

@@ -155,7 +155,6 @@ type streamCacheEntry struct {
 
 type wispConnection struct {
 	netConn      net.Conn
-	writeCh      chan writeReq
 	streams      sync.Map
 	isClosed     atomic.Bool
 	shutdownOnce sync.Once
@@ -164,6 +163,10 @@ type wispConnection struct {
 	remoteIP     string
 
 	streamCache [streamCacheSize]streamCacheEntry
+
+	pendingMutex  sync.Mutex
+	pendingWrites []writeReq
+	writeActive   bool
 
 	isV2          bool
 	handshakeDone chan struct{}
@@ -202,7 +205,10 @@ type wispStream struct {
 	pendingData  [][]byte
 	pendingBytes int
 
-	ingressCh chan ingressJob
+	ingressActive  atomic.Bool
+	pendingIngMu   sync.Mutex
+	pendingIngress []ingressJob
+	ingressWriting bool
 }
 
 type ingressJob struct {
