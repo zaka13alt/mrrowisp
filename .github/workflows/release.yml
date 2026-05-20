@@ -47,6 +47,6 @@ jobs:
           files: "dist/bin/*"
 
       - name: Publish
-        run: pnpm publish --no-git-checks
+        run: npm publish --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
