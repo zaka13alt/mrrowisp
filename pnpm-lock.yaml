@@ -14,13 +14,13 @@ importers:
       detect-port:
         specifier: ^2.1.0
         version: 2.1.0
+      typescript:
+        specifier: ^6.0.3
+        version: 6.0.3
     devDependencies:
       '@types/node':
         specifier: ^25.5.0
         version: 25.8.0
-      typescript:
-        specifier: ^6.0.3
-        version: 6.0.3
 
 packages:
 
