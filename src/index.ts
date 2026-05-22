@@ -168,10 +168,11 @@ export class Mrrowisp {
 				? (this.config.port[i] ?? this.config.port[this.config.port.length - 1])
 				: this.config.port;
 			const port = await this.getAvailablePort(nextPort!);
+			const { port: _port, ...config } = this.config;
 
 			const proc = spawn(
 				binPath,
-				["--config", JSON.stringify(this.config), "--port", port.toString()],
+				["--config", JSON.stringify(config), "--port", port.toString()],
 				{ stdio: "pipe" },
 			);
 
