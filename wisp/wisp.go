@@ -119,6 +119,13 @@ func CreateWispHandler(config *Config) http.HandlerFunc {
 		}
 
 		useV2 := config.EnableV2 && r.Header.Get("Sec-WebSocket-Protocol") != ""
+		if config.requiresV2() && !useV2 {
+			if config.Globals != nil && config.Globals.Connections != nil {
+				config.Globals.Connections.Release()
+			}
+			w.WriteHeader(http.StatusUpgradeRequired)
+			return
+		}
 
 		wsConn, err := upgrader.Upgrade(w, r)
 		if err != nil {
