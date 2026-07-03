@@ -2,7 +2,7 @@
 	"port": 6001,
 	"allowTCP": true,
 	"allowUDP": true,
-	"allowDirectIP": false,
+	"allowDirectIP": true,
 	"allowPrivateIPs": false,
 	"allowLoopbackIPs": false,
 	"tcpBufferSize": 65535,
